@@ -1,62 +1,31 @@
 from torch.utils.data import Dataset
-from glob import glob
+import glob
 import os
 import torch
+import torch.nn as nn  # <-- ADD THIS LINE
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+from PIL import Image # (Make sure this is there too if using the updated loader)
 
 class PCDataset(Dataset):
     def __init__(self, stage, transform=None):
         self.transform = transform
         self.stage = stage
 
-        if stage == "train":
-            image_paths = f"split/shapenet_train.txt"
-        elif stage == "test":
-            image_paths = f"split/shapenet_test.txt"
+        # Define your base directories for custom data
+        # Assume a structure like: data/train/images/, data/train/pointclouds/
+        self.base_dir = f"{stage}" 
+        self.image_dir = os.path.join(self.base_dir, "images")
+        self.pc_dir = os.path.join(self.base_dir, "pointclouds")
 
-        with open(image_paths) as caption_file:
-            self.filenames = caption_file.readlines()
-
-        self.numbers_list = [f"{i:02}" for i in range(24)]
-
-        labels = []
-        category = set()
-        for f in self.filenames:
-            attr = f.split("/")
-            labels.append(attr[1].strip())
-            category.add(attr[0])
-
-        category = list(category)
-        self.labels = []
-        self.data = []
-
-        for c in ["02958343", "02691156", "03001627"]:
-            for label in labels:
-                volume_path = f"C:\\Users\\appro\\Documents\\ShapeNet\\ShapeNet_pointclouds\\{c}\\{label}\\pointcloud_1024.npy"
-                files = glob(
-                    f"C:\\Users\\appro\\Documents\\ShapeNet\\ShapeNetRendering\\{c}\\{label}\\rendering\\*.png"
-                )
-                for file in files:
-                    if self.stage == "train":
-                        if os.path.exists(volume_path):
-                            self.data.append([c, label, file])
-
-                if self.stage == "test":
-                    if os.path.exists(volume_path) and len(files) > 1:
-                        test_image_path = f"C:\\Users\\appro\\Documents\\ShapeNet\\ShapeNetRendering\\{c}\\{label}\\rendering\\00.png"
-                        self.data.append([c, label, test_image_path])
+        # Gather all image files (assuming .png or .jpg)
+        self.image_files = sorted(glob.glob(os.path.join(self.image_dir, "*.png")) + 
+                                  glob.glob(os.path.join(self.image_dir, "*.jpg")))
 
     def __len__(self):
-        return len(self.data)
+        return len(self.image_files)
 
     def normalize_point_cloud(self, point_cloud):
-        """
-        Normalize a point cloud to be centered around the origin and fit within a unit cube.
-
-        :param point_cloud: Numpy array of shape (num_points, dimensions)
-        :return: Normalized point cloud.
-        """
         centroid = np.mean(point_cloud, axis=0)
         centered_point_cloud = point_cloud - centroid
         if self.stage == "train":
@@ -64,28 +33,26 @@ class PCDataset(Dataset):
         return centered_point_cloud
 
     def __getitem__(self, idx):
-        data = self.data[idx]
-        category = data[0]
-        label = data[1]
-        image = data[2]
+        # 1. Load Image
+        img_path = self.image_files[idx]
+        image = Image.open(img_path).convert("RGB")
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        # Add view dimension: [num_views, C, H, W] -> [1, C, H, W]
+        images_tensor = image.unsqueeze(0) 
 
-        image_files = [image]
-        pc = np.load(
-            f"C:\\Users\\appro\\Documents\\ShapeNet\\ShapeNet_pointclouds\\{category}\\{label}\\pointcloud_1024.npy"
-        )
+        # 2. Load Corresponding Ground Truth Point Cloud
+        # Assumes the pointcloud file shares the same base name (e.g., sample01.npy)
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        pc_path = os.path.join(self.pc_dir, f"{base_name}.npy")
+        
+        # Load your custom pointcloud (assuming a numpy array of shape [N, 3])
+        pc = np.load(pc_path) 
         pc = self.normalize_point_cloud(pc)
 
-        images = []
-        for filename in image_files:
-            image = Image.open(filename).convert("RGB")
-            if self.transform:
-                image = self.transform(image)
-            images.append(image)
-
-        name = f"{category}_{label}"
-        images_tensor = torch.stack(images, dim=0)
-
-        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), name
+        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), base_name
     
 
 
@@ -226,3 +193,34 @@ def predict(model, image_path, save_path):
 
     export_to_ply(output[0], save_path)
     print(f"Image from {image_path} saved to {save_path}")
+
+
+
+def pytorch_chamfer_distance(pc1, pc2):
+    """
+    Computes Chamfer Distance using pure PyTorch operations.
+    Accepts shapes (B, N, 3) or (N, 3).
+    """
+    # Ensure inputs are torch Tensors
+    if not isinstance(pc1, torch.Tensor):
+        pc1 = torch.from_numpy(pc1).float()
+    if not isinstance(pc2, torch.Tensor):
+        pc2 = torch.from_numpy(pc2).float()
+        
+    # Ensure inputs have a batch dimension [B, N, 3]
+    if pc1.dim() == 2:
+        pc1 = pc1.unsqueeze(0)
+    if pc2.dim() == 2:
+        pc2 = pc2.unsqueeze(0)
+
+    # Compute pairwise squared distance matrix: (B, N, M)
+    dist_matrix = torch.cdist(pc1, pc2, p=2) ** 2
+    
+    # Minimum distance from pc1 to pc2
+    min_dist_pc1_to_pc2 = torch.min(dist_matrix, dim=2)[0]
+    # Minimum distance from pc2 to pc1
+    min_dist_pc2_to_pc1 = torch.min(dist_matrix, dim=1)[0]
+    
+    # Return scalar mean of bidirectional distances
+    chamfer_loss = torch.mean(min_dist_pc1_to_pc2) + torch.mean(min_dist_pc2_to_pc1)
+    return chamfer_loss

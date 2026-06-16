@@ -1,213 +1,190 @@
-
+import argparse  # Added for dynamic runtime configuration
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from torch.utils.data import  DataLoader
+from torch.utils.data import DataLoader
 import torch.optim as optim
 from PIL import Image
 import numpy as np
 from glob import glob
 from accelerate import Accelerator
-
-from chamferdist import ChamferDistance
+from utils import PCDataset, EMDLoss, fscore, pytorch_chamfer_distance
 import open3d as o3d
 from tqdm import tqdm
+import os
 
-from utils import PCDataset, chamfer_distance, EMDLoss, fscore
 from model import PointCloudNet
 
-
-
 if __name__ == "__main__":
+    # ==============================================================================
+    # CONFIGURATION & TRANSFER LEARNING ARGUMENTS
+    # ==============================================================================
+    parser = argparse.ArgumentParser(description="RGB2Point Sonar Training Pipeline")
+    parser.add_argument("--transfer_learning", action="store_true", help="Enable transfer learning from an existing checkpoint")
+    parser.add_argument("--checkpoint_path", type=str, default="", help="Path to the initial .pth checkpoint file")
+    parser.add_argument("--freeze_backbone", action="store_true", help="Freeze the pretrained ViT backbone weights")
+    args = parser.parse_args()
+
     accelerator = Accelerator(log_with="wandb")
     transform = transforms.Compose(
         [
-            transforms.Resize((224, 224)),
+            transforms.Resize((224, 224)), 
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ]
     )
 
-    batch_size = 32
+    batch_size = 512
+    num_epochs = 200
     device = accelerator.device
 
+    CUSTOM_PC_SIZE = 1024 
+    EXPERIMENT = "Didson-blur"
+    COMENT="Transfer-DDO"
+    DATASET = f"data/{EXPERIMENT}"
+    
+    model_save_name = f"best_model_{EXPERIMENT}-{COMENT}.pth"
+    last_model_save_name = f"last_model_{EXPERIMENT}-{COMENT}.pth"
+
+    # 1. Initialize base model architecture
     model = PointCloudNet(
-        num_views=1, point_cloud_size=1024, num_heads=4, dim_feedforward=2048
+        num_views=1, point_cloud_size=CUSTOM_PC_SIZE, num_heads=4, dim_feedforward=2048
     )
-    optimizer = optim.Adam(model.parameters(), lr=5e-4)
+    
+    # 2. Apply Transfer Learning Weights (If Toggled)
+    if args.transfer_learning:
+        if args.checkpoint_path and os.path.exists(args.checkpoint_path):
+            accelerator.print(f" --> Loading weights for Transfer Learning from: {args.checkpoint_path}")
+            checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
+            
+            # Extract state dict (handles cases where weights are wrapped inside a 'model' dictionary)
+            state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+            
+            # strict=False allows matching parameters even if custom output cloud counts differ
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                accelerator.print(f"     Note: Missing keys ignored (Expected for new output dimensions): {len(missing_keys)}")
+        else:
+            accelerator.print(f" [ERROR] --transfer_learning was set, but --checkpoint_path is invalid or empty!")
+            exit(1)
+
+    # 3. Handle Parameter Freezing Strategy
+    if args.freeze_backbone:
+        accelerator.print(" --> Freezing Vision Transformer backbone. Training final layers only.")
+        for param in model.vit.parameters():
+            param.requires_grad = False
+    else:
+        accelerator.print(" --> Unfreezing full network. Optimization will adjust all weights.")
+        for param in model.vit.parameters():
+            param.requires_grad = True
+
+    # Filter optimizer to only track parameters requiring gradients
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params, lr=5e-4)
+    
     sche = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.7,
         patience=5,
         min_lr=1e-5,
-        verbose=True,
         threshold=0.01,
     )
-
-    threshold = 0.001
-    alpha = 5.0
-
-    num_epochs = 1000
-
+    
     accelerator.init_trackers(project_name="wacv_pc1024", config={})
 
-    chamferDist = ChamferDistance()
-    label_table = {
-        "02691156": "airplane",
-        "02828884": "bench",
-        "04379243": "table",
-        "02933112": "cabinet",
-        "02958343": "car",
-        "03001627": "chair",
-        "03211117": "display",
-        "03636649": "lamp",
-        "03691459": "loudspeaker",
-        "04090263": "rifle",
-        "04256520": "sofa",
-        "04379243": "table",
-        "04401088": "telephone",
-        "04530566": "watercraft",
-    }
-
-
-    dataset = PCDataset(stage="train", transform=transform)
+    dataset = PCDataset(stage=f"{DATASET}/train", transform=transform)
     dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=12
+        dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=12, pin_memory=True
     )
-    test_dataset = PCDataset(stage="test", transform=transform)
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    test_dataset = PCDataset(stage=f"{DATASET}/test", transform=transform)
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=1, shuffle=False, num_workers=4, pin_memory=True
+    )
+    
     model, optimizer, dataloader, test_dataloader, sche = accelerator.prepare(
         model, optimizer, dataloader, test_dataloader, sche
     )
 
     best = 10000
-    mse = nn.MSELoss(reduction="mean")
 
-
-    
-
-    mae_loss = nn.L1Loss()
-    emd_loss = EMDLoss()
     for epoch in range(num_epochs):
+        # ==============================================================================
+        # TRAINING LOOP
+        # ==============================================================================
         model.train()
-        total_loss = 0.0
-        loss_history = []
-        unet_loss_history = []
-        iou_loss_history = []
-        uni_loss_history = []
-        mse_history = []
-        p_history = []
-        cd_history = []
-        radius = 0.01
-
-        """
-        Training
-        """
-        for idx, (images, gt_pc, name) in enumerate(dataloader):
+        train_loss_history = []
+        
+        train_pbar = tqdm(dataloader, desc=f"[Train Step | Epoch {epoch+1}]")
+        for idx, (images, gt_pc, name) in enumerate(train_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
+            
             optimizer.zero_grad()
-            batch_loss = 0.0
             out = model(images)
-            cd_loss = chamferDist(out, gt_pc, bidirectional=True) * 5.0
+            
+            cd_loss = pytorch_chamfer_distance(out, gt_pc) * 5.0
             loss = cd_loss
-            cd_history.append(cd_loss.item())
+            
             accelerator.backward(loss)
+            
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), 5.0)
-
+                
             optimizer.step()
-            iou_loss_history.append(loss.item())
+            train_loss_history.append(loss.item())
+            
+            train_pbar.set_postfix({"batch_loss": f"{loss.item():.4f}"})
 
-            if idx % 50 == 0:
-                accelerator.print(
-                    f"[Train|{epoch+1}] {idx}/{len(dataloader)} loss:{np.mean(iou_loss_history):.4f}  cd_loss:{np.mean(cd_history):.4f} "
-                )
-                accelerator.log(
-                    {
-                        "train_batch/loss": np.mean(iou_loss_history),
-                        "train_batch/cd_loss": np.mean(cd_history),
-                    }
-                )
-        accelerator.print(
-            f"[Train]Epoch {epoch + 1}, Loss:{np.mean(iou_loss_history):.4f} "
-        )
-        accelerator.log(
-            {
-                "train/loss": np.mean(iou_loss_history),
-                "train/cd_loss": np.mean(cd_history),
-                "train/epoch": epoch + 1,
-            }
-        )
+        mean_train_loss = np.mean(train_loss_history)
+        accelerator.print(f"[Train] Epoch {epoch + 1}, Loss: {mean_train_loss:.4f}")
+        accelerator.log({"train/loss": mean_train_loss, "train/epoch": epoch + 1})
+
+        # ==============================================================================
+        # TESTING / VALIDATION LOOP
+        # ==============================================================================
         model.eval()
+        test_loss_history = []
+        test_cd_history = []
 
-        total_loss = 0.0
-        loss_history = []
-        unet_loss_history = []
-        iou_loss_history = []
-        category_table = {}
-        gt_point = []
-        pred_point = []
-        cd_values = []
-        result = []
-        fscore_table = {}
-        cd_table = {}
-        """
-        Testing
-        """
-        for idx, (images, gt_pc, names) in tqdm(enumerate(test_dataloader)):
+        test_pbar = tqdm(test_dataloader, desc=f"[Test Step | Epoch {epoch+1}]")
+        for idx, (images, gt_pc, names) in enumerate(test_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
-            batch_loss = 0.0
+            
             with torch.no_grad():
                 out = model(images)
 
-            cd_loss = chamferDist(out, gt_pc, bidirectional=True) * 5.0
-            cd_values.append(cd_loss.item())
-
-            loss = cd_loss
-            loss_history.append(loss.item())
-            distance = chamfer_distance(
-                out[0].detach().cpu().numpy(), gt_pc[0].detach().cpu().numpy()
+            cd_loss = pytorch_chamfer_distance(out, gt_pc) * 5.0
+            test_loss_history.append(cd_loss.item())
+            
+            distance = pytorch_chamfer_distance(
+                out[0].unsqueeze(0), 
+                gt_pc[0].unsqueeze(0)
             )
+            test_cd_history.append(distance.item())
 
-            result.append(distance)
-            category = names[0].split("_")[0]
-            if category not in cd_table:
-                cd_table[category] = []
-            cd_table[category].append(distance)
-
-        accelerator.print(f"[Test]Epoch {epoch + 1},  loss:{np.mean(loss_history):.4f}")
-
-        f_mean_table = {}
-
-        f_mean = []
-        for key in fscore_table.keys():
-            f_mean_table[key] = np.mean(fscore_table[key])
-            f_mean.append(np.mean(f_mean_table[key]))
-        cdtable = {}
-        total_cd = 0
-        for key in cd_table.keys():
-            human_read_key = label_table[key]
-            cdtable[human_read_key] = np.mean(cd_table[key])
-            total_cd += cdtable[human_read_key]
-
-        accelerator.log(
-            {"test/loss": np.mean(loss_history), "cd": cdtable, "test/epoch": epoch + 1}
-        )
-        model_save_name = "mymodel.pth"
-        score = np.mean(-1 * total_cd)
-        sche.step(score)
-        if score < best:
-            best = score
-            if isinstance(model, nn.DataParallel):
-                data = {
-                    "model": model.module.state_dict(),
-                }
-                torch.save(data, model_save_name)
-            else:
-                data = {
-                    "model": model.state_dict(),
-                }
-                torch.save(data, model_save_name)
+        mean_test_loss = np.mean(test_loss_history)
+        mean_cd = np.mean(test_cd_history)
+        
+        accelerator.print(f"[Test] Epoch {epoch + 1}, Loss: {mean_test_loss:.4f}, Mean CD: {mean_cd:.4f}")
+        accelerator.log({
+            "test/loss": mean_test_loss, 
+            "test/mean_chamfer_dist": mean_cd, 
+            "test/epoch": epoch + 1
+        })
+        
+        sche.step(mean_test_loss)
+        
+        if isinstance(model, nn.DataParallel) or hasattr(model, 'module'):
+            current_state = {"model": model.module.state_dict()}
+        else:
+            current_state = {"model": model.state_dict()}
+            
+        torch.save(current_state, last_model_save_name)
+        
+        if mean_test_loss < best:
+            best = mean_test_loss
+            torch.save(current_state, model_save_name)
+            accelerator.print(f" --> Saved new best model checkpoint to: {model_save_name}")
