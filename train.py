@@ -36,12 +36,12 @@ if __name__ == "__main__":
 
     batch_size = 512
     learning_rate = 5e-5
-    num_epochs = 1000
+    num_epochs = 100
     device = accelerator.device
 
     CUSTOM_PC_SIZE = 1024 
     EXPERIMENT = "Didson-original"
-    COMENT="PINN-TRANSFER-1000-epochs"
+    COMENT="PINN-TRANSFER-100-epochs"
     DATASET = f"data/{EXPERIMENT}"
     
     model_save_name = f"best_model_{EXPERIMENT}-{COMENT}.pth"

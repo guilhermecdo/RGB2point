@@ -5,3 +5,4 @@ Weights-PINN/*
 wandb/*
 logs/*
 result/*
+*.pth
