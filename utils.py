@@ -50,9 +50,11 @@ class PCDataset(Dataset):
         
         # Load your custom pointcloud (assuming a numpy array of shape [N, 3])
         pc = np.load(pc_path) 
+        centroid = np.mean(pc, axis=0) # Save the real-world position
         pc = self.normalize_point_cloud(pc)
 
-        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), base_name
+        # Return the centroid alongside the data
+        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), torch.as_tensor(centroid, dtype=torch.float32), base_name
     
 
 
@@ -224,3 +226,61 @@ def pytorch_chamfer_distance(pc1, pc2):
     # Return scalar mean of bidirectional distances
     chamfer_loss = torch.mean(min_dist_pc1_to_pc2) + torch.mean(min_dist_pc2_to_pc1)
     return chamfer_loss
+
+
+class SonarPhysicsLoss(nn.Module):
+    def __init__(self, k_neighbors=8, lambda_smooth=1.0, lambda_incidence=0.5):
+        super(SonarPhysicsLoss, self).__init__()
+        self.k = k_neighbors
+        self.lambda_smooth = lambda_smooth
+        self.lambda_incidence = lambda_incidence
+
+    def forward(self, pred_pc, centroids):
+        """
+        pred_pc: [B, N, 3] centered generated point cloud
+        centroids: [B, 3] the original centers to restore absolute sonar range
+        """
+        batch_size, num_points, _ = pred_pc.shape
+        
+        # 1. Restore absolute coordinates relative to the sonar (assuming sonar is at 0,0,0)
+        absolute_pc = pred_pc + centroids.unsqueeze(1)
+        
+        # Calculate the sound propagation vector (r) from sonar to each point
+        # r_ij = P_ij / ||P_ij|| as defined in the paper's Equation 19
+        ranges = torch.norm(absolute_pc, p=2, dim=2, keepdim=True)
+        r_vectors = absolute_pc / (ranges + 1e-6)
+
+        # 2. Local Planarity / Smoothness Loss (Paper's piecewise planar assumption)
+        # Find K-nearest neighbors for every point
+        dist_matrix = torch.cdist(pred_pc, pred_pc)
+        _, nn_idx = torch.topk(dist_matrix, self.k, dim=2, largest=False)
+        
+        # Gather neighbor coordinates
+        # Shape: [B, N, K, 3]
+        batch_indices = torch.arange(batch_size).view(-1, 1, 1).expand(-1, num_points, self.k)
+        neighbors = pred_pc[batch_indices, nn_idx] 
+        
+        # Compute local center of neighbors
+        local_mean = torch.mean(neighbors, dim=2)
+        
+        # Smoothness loss: points should not deviate wildly from their local neighborhood
+        loss_smooth = torch.mean(torch.norm(pred_pc - local_mean, p=2, dim=2))
+
+        # 3. Acoustic Incidence Prior (Simplified n * r constraint)
+        # Approximate surface normal using the vector from the local mean to the point
+        # For a smooth monotonic surface facing the sonar, the local normal should roughly 
+        # oppose the propagation vector r.
+        approx_normals = pred_pc - local_mean
+        approx_normals = approx_normals / (torch.norm(approx_normals, p=2, dim=2, keepdim=True) + 1e-6)
+        
+        # We want the dot product (n . r) to be negative (meaning the surface faces the sonar)
+        # If the dot product is positive, the surface is facing away and couldn't reflect sound!
+        dot_product = torch.sum(approx_normals * r_vectors, dim=2)
+        
+        # Penalize positive dot products (surfaces facing away from the acoustic source)
+        loss_incidence = torch.mean(torch.relu(dot_product))
+
+        # Combine losses
+        total_physics_loss = (self.lambda_smooth * loss_smooth) + (self.lambda_incidence * loss_incidence)
+        
+        return total_physics_loss

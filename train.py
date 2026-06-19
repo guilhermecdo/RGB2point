@@ -8,7 +8,7 @@ from PIL import Image
 import numpy as np
 from glob import glob
 from accelerate import Accelerator
-from utils import PCDataset, EMDLoss, fscore, pytorch_chamfer_distance
+from utils import PCDataset, EMDLoss, fscore, pytorch_chamfer_distance, SonarPhysicsLoss
 import open3d as o3d
 from tqdm import tqdm
 import os
@@ -35,12 +35,13 @@ if __name__ == "__main__":
     )
 
     batch_size = 512
-    num_epochs = 200
+    learning_rate = 5e-5
+    num_epochs = 1000
     device = accelerator.device
 
     CUSTOM_PC_SIZE = 1024 
-    EXPERIMENT = "Didson-blur"
-    COMENT="Transfer-DDO"
+    EXPERIMENT = "Didson-original"
+    COMENT="PINN-TRANSFER-1000-epochs"
     DATASET = f"data/{EXPERIMENT}"
     
     model_save_name = f"best_model_{EXPERIMENT}-{COMENT}.pth"
@@ -80,14 +81,14 @@ if __name__ == "__main__":
 
     # Filter optimizer to only track parameters requiring gradients
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=5e-4)
+    optimizer = optim.Adam(trainable_params, lr=learning_rate)
     
     sche = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.7,
         patience=5,
-        min_lr=1e-5,
+        min_lr=1e-6,
         threshold=0.01,
     )
     
@@ -109,7 +110,9 @@ if __name__ == "__main__":
 
     best = 10000
 
-    for epoch in range(num_epochs):
+    physics_criterion = SonarPhysicsLoss(k_neighbors=8, lambda_smooth=1.0, lambda_incidence=0.5).to(device)
+
+for epoch in range(num_epochs):
         # ==============================================================================
         # TRAINING LOOP
         # ==============================================================================
@@ -117,61 +120,93 @@ if __name__ == "__main__":
         train_loss_history = []
         
         train_pbar = tqdm(dataloader, desc=f"[Train Step | Epoch {epoch+1}]")
-        for idx, (images, gt_pc, name) in enumerate(train_pbar):
+        
+        # UPDATE: Unpack the centroid here
+        for idx, (images, gt_pc, centroids, name) in enumerate(train_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
+            centroids = centroids.float().to(device) # Move centroids to GPU
             
             optimizer.zero_grad()
             out = model(images)
             
-            cd_loss = pytorch_chamfer_distance(out, gt_pc) * 5.0
-            loss = cd_loss
+            # 1. Data Loss (Chamfer)
+            cd_loss = pytorch_chamfer_distance(out, gt_pc) #* 5.0 originalmente existe essa multiplicao porem a loss CD estava com uma varicao muito alta
+            
+            # 2. Physics-Informed Loss
+            pinn_loss = physics_criterion(out, centroids)
+            
+            # Total Loss
+            loss = cd_loss + pinn_loss
             
             accelerator.backward(loss)
             
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 5.0)
+                accelerator.clip_grad_norm_(model.parameters(), 1.0)
                 
             optimizer.step()
             train_loss_history.append(loss.item())
             
-            train_pbar.set_postfix({"batch_loss": f"{loss.item():.4f}"})
+            train_pbar.set_postfix({
+                "Loss": f"{loss.item():.4f}", 
+                "CD": f"{cd_loss.item():.4f}", 
+                "PINN": f"{pinn_loss.item():.4f}"
+            })
 
         mean_train_loss = np.mean(train_loss_history)
         accelerator.print(f"[Train] Epoch {epoch + 1}, Loss: {mean_train_loss:.4f}")
         accelerator.log({"train/loss": mean_train_loss, "train/epoch": epoch + 1})
 
-        # ==============================================================================
+       # ==============================================================================
         # TESTING / VALIDATION LOOP
         # ==============================================================================
         model.eval()
         test_loss_history = []
         test_cd_history = []
+        test_pinn_history = []  # Added to track validation physics
 
         test_pbar = tqdm(test_dataloader, desc=f"[Test Step | Epoch {epoch+1}]")
-        for idx, (images, gt_pc, names) in enumerate(test_pbar):
+        
+        # UPDATE 1: Unpack 'centroids' alongside the other variables
+        for idx, (images, gt_pc, centroids, names) in enumerate(test_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
+            centroids = centroids.float().to(device)  # UPDATE 2: Move to GPU
             
             with torch.no_grad():
                 out = model(images)
 
-            cd_loss = pytorch_chamfer_distance(out, gt_pc) * 5.0
-            test_loss_history.append(cd_loss.item())
-            
-            distance = pytorch_chamfer_distance(
-                out[0].unsqueeze(0), 
-                gt_pc[0].unsqueeze(0)
-            )
-            test_cd_history.append(distance.item())
+                # 1. Data Loss (Chamfer)
+                cd_loss = pytorch_chamfer_distance(out, gt_pc) #* 5.0
+                
+                # 2. Physics Loss (To monitor validation compliance)
+                pinn_loss = physics_criterion(out, centroids)
+                
+                # Total Validation Loss
+                total_test_loss = cd_loss + pinn_loss
 
+            test_loss_history.append(total_test_loss.item())
+            test_cd_history.append(cd_loss.item())
+            test_pinn_history.append(pinn_loss.item())
+            
+            test_pbar.set_postfix({
+                "Loss": f"{total_test_loss.item():.4f}", 
+                "CD": f"{cd_loss.item():.4f}", 
+                "PINN": f"{pinn_loss.item():.4f}"
+            })
+
+        # Calculate epoch averages
         mean_test_loss = np.mean(test_loss_history)
         mean_cd = np.mean(test_cd_history)
+        mean_pinn = np.mean(test_pinn_history)
         
-        accelerator.print(f"[Test] Epoch {epoch + 1}, Loss: {mean_test_loss:.4f}, Mean CD: {mean_cd:.4f}")
+        accelerator.print(f"[Test] Epoch {epoch + 1}, Total: {mean_test_loss:.4f}, CD: {mean_cd:.4f}, PINN: {mean_pinn:.4f}")
+        
+        # UPDATE 3: Log the split metrics so you can track them on your Weights & Biases dashboard
         accelerator.log({
-            "test/loss": mean_test_loss, 
-            "test/mean_chamfer_dist": mean_cd, 
+            "test/total_loss": mean_test_loss, 
+            "test/chamfer_dist": mean_cd, 
+            "test/pinn_loss": mean_pinn,
             "test/epoch": epoch + 1
         })
         
