@@ -17,6 +17,7 @@ class PCDataset(Dataset):
         self.base_dir = f"{stage}" 
         self.image_dir = os.path.join(self.base_dir, "images")
         self.pc_dir = os.path.join(self.base_dir, "pointclouds")
+        self.pose_dir = os.path.join(self.base_dir, "poses")
 
         # Gather all image files (assuming .png or .jpg)
         self.image_files = sorted(glob.glob(os.path.join(self.image_dir, "*.png")) + 
@@ -32,30 +33,33 @@ class PCDataset(Dataset):
             np.random.shuffle(centered_point_cloud)
         return centered_point_cloud
 
-    def __getitem__(self, idx):
+def __getitem__(self, idx):
         # 1. Load Image
         img_path = self.image_files[idx]
         image = Image.open(img_path).convert("RGB")
-        
         if self.transform:
             image = self.transform(image)
-        
-        # Add view dimension: [num_views, C, H, W] -> [1, C, H, W]
         images_tensor = image.unsqueeze(0) 
 
         # 2. Load Corresponding Ground Truth Point Cloud
-        # Assumes the pointcloud file shares the same base name (e.g., sample01.npy)
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         pc_path = os.path.join(self.pc_dir, f"{base_name}.npy")
         
-        # Load your custom pointcloud (assuming a numpy array of shape [N, 3])
         pc = np.load(pc_path) 
-        centroid = np.mean(pc, axis=0) # Save the real-world position
+        centroid = np.mean(pc, axis=0)
         pc = self.normalize_point_cloud(pc)
 
-        # Return the centroid alongside the data
-        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), torch.as_tensor(centroid, dtype=torch.float32), base_name
-    
+        # 3. Load Corresponding Pose (Cross-Modal Input) # <--- ADD THIS BLOCK
+        pose_path = os.path.join(self.pose_dir, f"{base_name}.npy")
+        if os.path.exists(pose_path):
+            pose_matrix = np.load(pose_path) # Shape: (4, 4)
+            pose = pose_matrix.flatten()     # Shape: (16,)
+        else:
+            # Fallback is the Identity Matrix flattened
+            pose = np.eye(4, dtype=np.float32).flatten() 
+
+        # Return 5 variables
+        return images_tensor, torch.as_tensor(pc, dtype=torch.float32), torch.as_tensor(centroid, dtype=torch.float32), torch.as_tensor(pose, dtype=torch.float32), base_name
 
 
 def chamfer_distance(x, y, metric="l2", direction="bi"):

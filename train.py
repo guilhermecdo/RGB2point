@@ -20,9 +20,19 @@ if __name__ == "__main__":
     # CONFIGURATION & TRANSFER LEARNING ARGUMENTS
     # ==============================================================================
     parser = argparse.ArgumentParser(description="RGB2Point Sonar Training Pipeline")
+    
+    # Existing Arguments
     parser.add_argument("--transfer_learning", action="store_true", help="Enable transfer learning from an existing checkpoint")
     parser.add_argument("--checkpoint_path", type=str, default="", help="Path to the initial .pth checkpoint file")
     parser.add_argument("--freeze_backbone", action="store_true", help="Freeze the pretrained ViT backbone weights")
+    
+    # NEW: Automated Sweep Arguments
+    parser.add_argument("--experiment", type=str, required=True, help="Name of the dataset/experiment (e.g., original, blur)")
+    parser.add_argument("--data_root", type=str, default="data_ready", help="Root folder containing the datasets")
+    parser.add_argument("--comment", type=str, default="sweep", help="Tag to append to saved model names")
+    parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training")
+    
     args = parser.parse_args()
 
     accelerator = Accelerator(log_with="wandb")
@@ -34,15 +44,17 @@ if __name__ == "__main__":
         ]
     )
 
-    batch_size = 512
-    learning_rate = 5e-5
-    num_epochs = 100
+    # Use the dynamic arguments instead of hardcoded variables
+    batch_size = args.batch_size
+    num_epochs = args.epochs
     device = accelerator.device
 
     CUSTOM_PC_SIZE = 1024 
-    EXPERIMENT = "Didson-original"
-    COMENT="PINN-TRANSFER-100-epochs"
-    DATASET = f"data/{EXPERIMENT}"
+    EXPERIMENT = args.experiment
+    COMENT = args.comment
+    
+    # Dynamically point to the correct subfolder in data_ready
+    DATASET = f"{args.data_root}/{EXPERIMENT}"
     
     model_save_name = f"best_model_{EXPERIMENT}-{COMENT}.pth"
     last_model_save_name = f"last_model_{EXPERIMENT}-{COMENT}.pth"
@@ -57,11 +69,7 @@ if __name__ == "__main__":
         if args.checkpoint_path and os.path.exists(args.checkpoint_path):
             accelerator.print(f" --> Loading weights for Transfer Learning from: {args.checkpoint_path}")
             checkpoint = torch.load(args.checkpoint_path, map_location="cpu")
-            
-            # Extract state dict (handles cases where weights are wrapped inside a 'model' dictionary)
             state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-            
-            # strict=False allows matching parameters even if custom output cloud counts differ
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
             if missing_keys:
                 accelerator.print(f"     Note: Missing keys ignored (Expected for new output dimensions): {len(missing_keys)}")
@@ -81,20 +89,37 @@ if __name__ == "__main__":
 
     # Filter optimizer to only track parameters requiring gradients
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=learning_rate)
+    optimizer = optim.Adam(trainable_params, lr=5e-4)
     
     sche = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
         factor=0.7,
         patience=5,
-        min_lr=1e-6,
+        min_lr=1e-5,
         threshold=0.01,
     )
     
-    accelerator.init_trackers(project_name="wacv_pc1024", config={})
+    # Track the experiment name dynamically in wandb
+    
+    accelerator.init_trackers(
+        project_name="wacv_pc1024", 
+        config={
+            "experiment": EXPERIMENT,
+            "batch_size": batch_size,
+            "epochs": num_epochs,
+            "transfer_learning": args.transfer_learning
+        },
+        init_kwargs={
+            "wandb": {
+                "name": f"{EXPERIMENT}-{COMENT}"
+            }
+        }
+    )
 
+    # The rest of your DataLoader and Training loop remains exactly the same below this...
     dataset = PCDataset(stage=f"{DATASET}/train", transform=transform)
+
     dataloader = DataLoader(
         dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=12, pin_memory=True
     )
@@ -122,13 +147,16 @@ for epoch in range(num_epochs):
         train_pbar = tqdm(dataloader, desc=f"[Train Step | Epoch {epoch+1}]")
         
         # UPDATE: Unpack the centroid here
-        for idx, (images, gt_pc, centroids, name) in enumerate(train_pbar):
+        for idx, (images, gt_pc, centroids, poses, name) in enumerate(train_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
-            centroids = centroids.float().to(device) # Move centroids to GPU
+            centroids = centroids.float().to(device)
+            poses = poses.float().to(device) # Move pose to GPU
             
             optimizer.zero_grad()
-            out = model(images)
+            
+            # Pass both images and poses to the network
+            out = model(images, poses)
             
             # 1. Data Loss (Chamfer)
             cd_loss = pytorch_chamfer_distance(out, gt_pc) #* 5.0 originalmente existe essa multiplicao porem a loss CD estava com uma varicao muito alta
@@ -168,13 +196,15 @@ for epoch in range(num_epochs):
         test_pbar = tqdm(test_dataloader, desc=f"[Test Step | Epoch {epoch+1}]")
         
         # UPDATE 1: Unpack 'centroids' alongside the other variables
-        for idx, (images, gt_pc, centroids, names) in enumerate(test_pbar):
+        for idx, (images, gt_pc, centroids, poses, names) in enumerate(test_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
-            centroids = centroids.float().to(device)  # UPDATE 2: Move to GPU
+            centroids = centroids.float().to(device)
+            poses = poses.float().to(device) # Move pose to GPU
             
             with torch.no_grad():
-                out = model(images)
+                # Pass both images and poses to the network
+                out = model(images, poses)
 
                 # 1. Data Loss (Chamfer)
                 cd_loss = pytorch_chamfer_distance(out, gt_pc) #* 5.0

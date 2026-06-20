@@ -6,3 +6,4 @@ wandb/*
 logs/*
 result/*
 *.pth
+*SEE/
