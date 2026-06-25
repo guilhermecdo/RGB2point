@@ -13,13 +13,12 @@ class PCDataset(Dataset):
         self.stage = stage
 
         # Define your base directories for custom data
-        # Assume a structure like: data/train/images/, data/train/pointclouds/
         self.base_dir = f"{stage}" 
         self.image_dir = os.path.join(self.base_dir, "images")
         self.pc_dir = os.path.join(self.base_dir, "pointclouds")
-        self.pose_dir = os.path.join(self.base_dir, "poses")
+        self.pose_dir = os.path.join(self.base_dir, "poses") # Added pose directory
 
-        # Gather all image files (assuming .png or .jpg)
+        # Gather all image files
         self.image_files = sorted(glob.glob(os.path.join(self.image_dir, "*.png")) + 
                                   glob.glob(os.path.join(self.image_dir, "*.jpg")))
 
@@ -29,38 +28,38 @@ class PCDataset(Dataset):
     def normalize_point_cloud(self, point_cloud):
         centroid = np.mean(point_cloud, axis=0)
         centered_point_cloud = point_cloud - centroid
-        if self.stage == "train":
+        if "train" in self.stage:
             np.random.shuffle(centered_point_cloud)
         return centered_point_cloud
 
-def __getitem__(self, idx):
+    def __getitem__(self, idx):
         # 1. Load Image
         img_path = self.image_files[idx]
         image = Image.open(img_path).convert("RGB")
+        
         if self.transform:
             image = self.transform(image)
+        
         images_tensor = image.unsqueeze(0) 
 
-        # 2. Load Corresponding Ground Truth Point Cloud
+        # 2. Load Corresponding Point Cloud and Centroid
         base_name = os.path.splitext(os.path.basename(img_path))[0]
         pc_path = os.path.join(self.pc_dir, f"{base_name}.npy")
         
         pc = np.load(pc_path) 
-        centroid = np.mean(pc, axis=0)
+        centroid = np.mean(pc, axis=0) # Crucial for physics loss
         pc = self.normalize_point_cloud(pc)
 
-        # 3. Load Corresponding Pose (Cross-Modal Input) # <--- ADD THIS BLOCK
+        # 3. Load Pose (4x4 matrix flattened to 16)
         pose_path = os.path.join(self.pose_dir, f"{base_name}.npy")
         if os.path.exists(pose_path):
-            pose_matrix = np.load(pose_path) # Shape: (4, 4)
-            pose = pose_matrix.flatten()     # Shape: (16,)
+            pose_matrix = np.load(pose_path)
+            pose = pose_matrix.flatten()
         else:
-            # Fallback is the Identity Matrix flattened
             pose = np.eye(4, dtype=np.float32).flatten() 
 
-        # Return 5 variables
+        # MUST BE 5 ITEMS
         return images_tensor, torch.as_tensor(pc, dtype=torch.float32), torch.as_tensor(centroid, dtype=torch.float32), torch.as_tensor(pose, dtype=torch.float32), base_name
-
 
 def chamfer_distance(x, y, metric="l2", direction="bi"):
     """Chamfer distance between two point clouds

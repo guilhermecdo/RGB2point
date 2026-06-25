@@ -1,7 +1,7 @@
 data/*
 *Didson
-weigths/*
-Weights-PINN/*
+weigths*/*
+evaluation*/*
 wandb/*
 logs/*
 result/*

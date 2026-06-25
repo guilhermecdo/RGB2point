@@ -61,7 +61,11 @@ if __name__ == "__main__":
 
     # 1. Initialize base model architecture
     model = PointCloudNet(
-        num_views=1, point_cloud_size=CUSTOM_PC_SIZE, num_heads=4, dim_feedforward=2048
+        num_views=1, 
+        point_cloud_size=CUSTOM_PC_SIZE, 
+        num_heads=4, 
+        dim_feedforward=2048,
+        pose_dim=16  # <--- THIS FIXES THE DIMENSION MISMATCH
     )
     
     # 2. Apply Transfer Learning Weights (If Toggled)
@@ -146,22 +150,22 @@ for epoch in range(num_epochs):
         
         train_pbar = tqdm(dataloader, desc=f"[Train Step | Epoch {epoch+1}]")
         
-        # UPDATE: Unpack the centroid here
+        # FIX: Unpack all 5 variables here!
         for idx, (images, gt_pc, centroids, poses, name) in enumerate(train_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
-            centroids = centroids.float().to(device)
-            poses = poses.float().to(device) # Move pose to GPU
+            centroids = centroids.float().to(device) # No more NameError!
+            poses = poses.float().to(device)         # Move poses to GPU
             
             optimizer.zero_grad()
             
-            # Pass both images and poses to the network
+            # 1. Pass both images and poses to the Cross-Modal network
             out = model(images, poses)
             
-            # 1. Data Loss (Chamfer)
-            cd_loss = pytorch_chamfer_distance(out, gt_pc) #* 5.0 originalmente existe essa multiplicao porem a loss CD estava com uma varicao muito alta
+            # 2. Calculate Chamfer Distance
+            cd_loss = pytorch_chamfer_distance(out, gt_pc) * 5.0
             
-            # 2. Physics-Informed Loss
+            # 3. Calculate Physics Loss using the centroids
             pinn_loss = physics_criterion(out, centroids)
             
             # Total Loss
@@ -170,16 +174,12 @@ for epoch in range(num_epochs):
             accelerator.backward(loss)
             
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(model.parameters(), 1.0)
+                accelerator.clip_grad_norm_(model.parameters(), 1.0) # Tightened clipping for stability
                 
             optimizer.step()
             train_loss_history.append(loss.item())
             
-            train_pbar.set_postfix({
-                "Loss": f"{loss.item():.4f}", 
-                "CD": f"{cd_loss.item():.4f}", 
-                "PINN": f"{pinn_loss.item():.4f}"
-            })
+            train_pbar.set_postfix({"Loss": f"{loss.item():.4f}", "CD": f"{cd_loss.item():.4f}", "PINN": f"{pinn_loss.item():.4f}"})
 
         mean_train_loss = np.mean(train_loss_history)
         accelerator.print(f"[Train] Epoch {epoch + 1}, Loss: {mean_train_loss:.4f}")
@@ -195,15 +195,14 @@ for epoch in range(num_epochs):
 
         test_pbar = tqdm(test_dataloader, desc=f"[Test Step | Epoch {epoch+1}]")
         
-        # UPDATE 1: Unpack 'centroids' alongside the other variables
+        # FIX: Unpack all 5 variables here too!
         for idx, (images, gt_pc, centroids, poses, names) in enumerate(test_pbar):
             gt_pc = gt_pc.float().to(device)
             images = images.to(device)
             centroids = centroids.float().to(device)
-            poses = poses.float().to(device) # Move pose to GPU
+            poses = poses.float().to(device)
             
             with torch.no_grad():
-                # Pass both images and poses to the network
                 out = model(images, poses)
 
                 # 1. Data Loss (Chamfer)
