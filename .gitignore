@@ -7,3 +7,4 @@ logs/*
 result/*
 *.pth
 *SEE/
+comparison*/

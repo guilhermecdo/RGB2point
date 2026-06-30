@@ -16,7 +16,8 @@ from model import PointCloudNet
 EXPERIMENT_NAME = "all_combined" 
 TEST_DIR = f"data/all_combined/train"
 #MODEL_WEIGHTS = f"best_model_all_combined-PINN-CROSMODAL-POSE.pth" 
-MODEL_WEIGHTS = f"best_model_all_combined-PINN-CROSMODAL-POSE.pth" 
+#MODEL_WEIGHTS = f"/home/guilherme/git/RGB2point/weigths-PINN-CROSMODAL-POSE/best_model_all_combined-PINN-CROSMODAL-POSE.pth" 
+MODEL_WEIGHTS = f"/home/guilherme/git/RGB2point/weights-PINN/best_model_Didson-Denoise-original-PINN.pth"
 
 # Model parameters (Must match what you used in training!)
 CUSTOM_PC_SIZE = 1024  
@@ -30,9 +31,9 @@ POSE_DIM = 16
 # Paste the exact names (without .png) of the images you want to test here.
 # If you leave this list empty [], it will grab random samples instead.
 TARGET_IMAGES = [
-    "blur_Didson-1-Sphere-1",
-    "denoise_Didson-1-Sphere-1",
-    "original_Didson-1-Sphere-1"
+    "blur_Didson-2-Sphere-5",
+    "denoise_Didson-2-Sphere-5",
+    "original_Didson-2-Sphere-5"
     
 ]
 
